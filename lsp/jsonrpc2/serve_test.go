@@ -10,12 +10,10 @@ import (
 	"testing"
 	"time"
 
-	jsonrpc2 "golang.org/x/tools/internal/jsonrpc2_v2"
-	"golang.org/x/tools/internal/stack/stacktest"
+	"go.starlark.net/lsp/jsonrpc2"
 )
 
 func TestIdleTimeout(t *testing.T) {
-	stacktest.NoLeak(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -77,7 +75,6 @@ func (fakeHandler) Handle(ctx context.Context, req *jsonrpc2.Request) (interface
 }
 
 func TestServe(t *testing.T) {
-	stacktest.NoLeak(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

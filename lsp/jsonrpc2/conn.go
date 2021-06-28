@@ -9,11 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"sync/atomic"
 
-	"golang.org/x/tools/internal/event"
-	"golang.org/x/tools/internal/event/label"
-	"golang.org/x/tools/internal/lsp/debug/tag"
 	errors "golang.org/x/xerrors"
 )
 
@@ -127,19 +125,7 @@ func (c *Connection) Notify(ctx context.Context, method string, params interface
 	if err != nil {
 		return errors.Errorf("marshaling notify parameters: %v", err)
 	}
-	ctx, done := event.Start(ctx, method,
-		tag.Method.Of(method),
-		tag.RPCDirection.Of(tag.Outbound),
-	)
-	event.Metric(ctx, tag.Started.Of(1))
 	err = c.write(ctx, notify)
-	switch {
-	case err != nil:
-		event.Label(ctx, tag.StatusCode.Of("ERROR"))
-	default:
-		event.Label(ctx, tag.StatusCode.Of("OK"))
-	}
-	done()
 	return err
 }
 
@@ -160,13 +146,8 @@ func (c *Connection) Call(ctx context.Context, method string, params interface{}
 		result.resultBox <- asyncResult{err: errors.Errorf("marshaling call parameters: %w", err)}
 		return result
 	}
-	ctx, endSpan := event.Start(ctx, method,
-		tag.Method.Of(method),
-		tag.RPCDirection.Of(tag.Outbound),
-		tag.RPCID.Of(fmt.Sprintf("%q", result.id)),
-	)
+	ctx, endSpan := context.WithCancel(ctx)
 	result.endSpan = endSpan
-	event.Metric(ctx, tag.Started.Of(1))
 	// We have to add ourselves to the pending map before we send, otherwise we
 	// are racing the response.
 	// rchan is buffered in case the response arrives without a listener.
@@ -211,15 +192,12 @@ func (a *AsyncCall) Await(ctx context.Context, result interface{}) error {
 		switch {
 		case response.Error != nil:
 			r.err = response.Error
-			event.Label(ctx, tag.StatusCode.Of("ERROR"))
 		default:
 			r.result = response.Result
-			event.Label(ctx, tag.StatusCode.Of("OK"))
 		}
 	case r = <-a.resultBox:
 		// result already available
 	case <-ctx.Done():
-		event.Label(ctx, tag.StatusCode.Of("CANCELLED"))
 		return ctx.Err()
 	}
 	// refill the box for the next caller
@@ -292,7 +270,7 @@ func (c *Connection) readIncoming(ctx context.Context, reader Reader, toQueue ch
 	for {
 		// get the next message
 		// no lock is needed, this is the only reader
-		msg, n, err := reader.Read(ctx)
+		msg, _, err := reader.Read(ctx)
 		if err != nil {
 			// The stream failed, we cannot continue
 			c.async.setError(err)
@@ -302,19 +280,9 @@ func (c *Connection) readIncoming(ctx context.Context, reader Reader, toQueue ch
 		case *Request:
 			entry := &incoming{
 				request: msg,
+				baseCtx: context.Background(),
+				done:    func() {}, // TODO(eac): figure out if needed
 			}
-			// add a span to the context for this request
-			labels := append(make([]label.Label, 0, 3), // make space for the id if present
-				tag.Method.Of(msg.Method),
-				tag.RPCDirection.Of(tag.Inbound),
-			)
-			if msg.IsCall() {
-				labels = append(labels, tag.RPCID.Of(fmt.Sprintf("%q", msg.ID)))
-			}
-			entry.baseCtx, entry.done = event.Start(ctx, msg.Method, labels...)
-			event.Metric(entry.baseCtx,
-				tag.Started.Of(1),
-				tag.ReceivedBytes.Of(n))
 			// in theory notifications cannot be cancelled, but we build them a cancel context anyway
 			entry.handleCtx, entry.cancel = context.WithCancel(entry.baseCtx)
 			// if the request is a call, add it to the incoming map so it can be
@@ -427,7 +395,10 @@ func (c *Connection) reply(entry *incoming, result interface{}, rerr error) {
 	if err := c.respond(entry, result, rerr); err != nil {
 		// no way to propagate this error
 		//TODO: should we do more than just log it?
-		event.Error(entry.baseCtx, "jsonrpc2 message delivery failed", err)
+
+		// TODO(eac): add logger?
+		fmt.Fprintf(os.Stderr, "jsonrpc2 message delivery failed: %s\n", err)
+
 	}
 }
 
@@ -460,12 +431,6 @@ func (c *Connection) respond(entry *incoming, result interface{}, rerr error) er
 			// normal notification finish
 		}
 	}
-	switch {
-	case rerr != nil || err != nil:
-		event.Label(entry.baseCtx, tag.StatusCode.Of("ERROR"))
-	default:
-		event.Label(entry.baseCtx, tag.StatusCode.Of("OK"))
-	}
 	// and just to be clean, invoke and clear the cancel if needed
 	if entry.cancel != nil {
 		entry.cancel()
@@ -481,7 +446,6 @@ func (c *Connection) respond(entry *incoming, result interface{}, rerr error) er
 func (c *Connection) write(ctx context.Context, msg Message) error {
 	writer := <-c.writerBox
 	defer func() { c.writerBox <- writer }()
-	n, err := writer.Write(ctx, msg)
-	event.Metric(ctx, tag.SentBytes.Of(n))
+	_, err := writer.Write(ctx, msg)
 	return err
 }
